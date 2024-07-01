@@ -1,10 +1,8 @@
-import re
 import requests
 
 from bs4 import BeautifulSoup
-
-from crawling.config.config import *
-from crawling.database.manager import DatabaseManager, db_config
+from ..config.set_up import set_header, setup_logging, crawling_waiting_time
+from ..database.handler import DatabaseHandler
 
 
 def construct_url(category_id, page):
@@ -31,52 +29,42 @@ def requests_get_html(url):
     response.raise_for_status()
     return response.text
 
-
 def check_last_page(category_id):
     response = requests.get(construct_url(category_id, 1), headers=set_header())
+    crawling_waiting_time()
     response.raise_for_status()
     soup = BeautifulSoup(response.text, 'html.parser')
     page = soup.find('div', class_='product-list-paging')
     return int(page['data-total'])
 
-def get_last_pages(categories_id):
-    last_pages = []
-    for category_id in categories_id:
-        last_pages.append(check_last_page(category_id))
-    return last_pages
+def get_last_pages(**context):
+    categories_id = setup_categories_id()
+    last_pages = [check_last_page(category_id) for category_id in categories_id]
+    context["task_instance"].xcom_push(key="last_pages", value=last_pages)
 
-def create_url_list(categories_id, last_pages):
+def create_url_list(**context):
+    last_pages = context["task_instance"].xcom_pull(
+        task_ids="get_last_pages", key="last_pages"
+    )
     url_list = []
-    for category_id, last_page in zip(categories_id, last_pages):
+    for category_id, last_page in zip(setup_categories_id(), last_pages):
         for page in range(1, last_page + 1):
-            url_list.append(construct_url(category_id, page))
-    return url_list
+            url_list.append([construct_url(category_id, page), category_id])
+    context["task_instance"].xcom_push(key="url_list", value=url_list)
 
 class CoupangCrawler:
-    def __init__(self, max_pages=10):
-        self.categories_id = setup_categories_id()
+    def __init__(self):
         self.logger = setup_logging()
-        self.max_pages = max_pages
-        self.database_manager = DatabaseManager(db_config=db_config)
+        self.db_handler = DatabaseHandler()
+        self.db_handler.create_coupang_products()
 
-    def crawl(self):
-        try:
-            self.database_manager.connect()
-            for category_id in self.categories_id:
-                self.crawl_category(category_id)
-        finally:
-            self.database_manager.close()
-
-    def crawl_category(self, category_id):
-        last_page = check_last_page(category_id)
-        crawling_waiting_time()
-        for page in range(1, min(last_page, self.max_pages) + 1):
-            logging.info(f"------category_id: {category_id}, page: {page}------")
-            self.crawl_page(category_id, page)
+    def crawl(self, url_list):
+        for url in url_list:
+            self.crawl_page(url[0], url[1])
             crawling_waiting_time()
 
-    def crawl_page(self, category_id, page):
-        response = requests.get(construct_url(category_id, page), headers=set_header())
+    def crawl_page(self, url, category_id):
+        response = requests.get(url, headers=set_header())
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
         items = soup.find('ul', id='productList').find_all('li')
@@ -89,28 +77,18 @@ class CoupangCrawler:
                 title = item.find('div', class_='name').text
                 price = item.find('strong', class_='price-value').text
                 star = item.find('em', class_='rating').text
-
-                # per_price 괄호와 "100g당", "원" 제거
                 per_price = item.find('span', class_='unit-price').text
-                per_price = re.sub(r'\(100g당\s*|\s*원\)|\(|\)', '', per_price).strip()
-
-                # review_count 괄호 제거
                 review_count = item.find('span', class_='rating-total-count').text
-                review_count = re.sub(r'[\(\)]', '', review_count).strip()
 
-                # price와 per_price에서 쉼표 제거
-                price = int(price.replace(',', ''))
-                per_price = int(per_price.replace(',', ''))
-
-                self.logger.info(
-                    f"category_id: {category_id}, product_id: {product_id}, title: {title}, price: {price}, "
-                    f"per_price: {per_price}, star: {star}, review_cnt: {review_count}")
+                self.db_handler.insert_product(product_id, title, price, per_price, star, review_count, category_id)
 
             except Exception:
                 # 리뷰, 별점 등의 정보가 없는 경우
                 continue
 
-
-if __name__ == '__main__':
+def crawl(**context):
+    url_list = context["task_instance"].xcom_pull(
+        task_ids="create_url_list", key="url_list"
+    )
     crawler = CoupangCrawler()
-    crawler.crawl()
+    crawler.crawl(url_list)

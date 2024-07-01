@@ -10,7 +10,6 @@ def set_header() -> dict[str, str]:
         "Accept-Language": "ko-KR,ko;q=0.8,en-US;q=0.5,en;q=0.3"
     }
 
-
 def setup_logging() -> logging.Logger:
     logging.basicConfig(
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
